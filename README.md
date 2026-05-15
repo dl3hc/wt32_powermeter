@@ -85,6 +85,8 @@ The following steps are required to compile and upload the code to the board:
 
 1. Connect the board to a USB-to-serial adapter as shown in the picture below.
 
+![Programming](docs/remote-power-meter-8.png)
+
 2. Select the correct COM port in the Arduino IDE:  
    **Tools → Port → Select Port**
 
@@ -95,6 +97,8 @@ The following steps are required to compile and upload the code to the board:
 ## Connecting the Board to the Directional Coupler
 
 The two pins **IO0** and **GND** only need to be bridged during programming. Remove the bridge again after programming.
+
+![Connection](docs/remote-power-meter-9.png)
 
 ---
 
@@ -171,6 +175,8 @@ The IP address is either the one defined in the code or one assigned dynamically
 ## Usage
 
 The first step is to configure the connected directional couplers. To do this, click **Configuration** in the left footer of the page.
+
+![Usage](docs/remote-power-meter-10.png)
 
 ---
 
