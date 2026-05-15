@@ -39,13 +39,7 @@ Matthias DD1US uses the following components in his implementations, among other
 
 My own implementation uses the directional coupler from an old SWR/power meter.
 
-After removing it from the enclosure, it still needed shielding.
-
-It fits perfectly into my favorite €5 project box  
-(*Donau Elektronik – KGB15 Euro Box, small, blue, 95 × 135 × 45 mm*)  
-with custom 3D-printed front panels.
-
-The wiring was done according to the diagram shown further below.
+The wiring was done according to the picture shown further below.
 
 ### Software / Libraries
 
