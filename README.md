@@ -1,10 +1,10 @@
 # Remote Power/SWR Meter
 
-This repository is a fork of DK1MI’s original project. It was cloned here for preservation and personal use. The original authorship and credit remain with DK1MI.
+This repository is a fork of DK1MI's original project, maintained by DL3HC. Original authorship and credit for the initial design remain with DK1MI.
 
 This WT32/ESP32-based project, combined with a directional coupler setup, allows you to remotely monitor the output power and SWR of your station via a web browser.
 
-To achieve this, it reads two voltages supplied by the directional couplers. From these, the respective power is calculated with the help of a table created by the user.
+To achieve this, it reads two voltages supplied by the directional couplers. From these, the respective power is calculated with the help of a calibration table created by the user.
 
 Special thanks to Matthias DD1US for support with the directional coupler setup, software testing, and ideas for additional features.
 
@@ -37,7 +37,7 @@ Special thanks to Matthias DD1US for support with the directional coupler setup,
 - Added OTA (over-the-air) firmware updates over the network
   - Protected by a password; on first use you are required to replace the default password
     before the device becomes usable
-  - Updating via USB always remains available as a fallback (see the new `HOWTO.md`)
+  - Updating via USB always remains available as a fallback (see `HOWTO.md`)
 - Added a watchdog timer that automatically reboots the device if it becomes unresponsive
 - Modernized the web dashboard and configuration page with a new dark, instrument-panel-style
   visual design
@@ -65,6 +65,7 @@ The following hardware is required for this project:
 - WT32-ETH01 development board
 - USB-to-serial adapter (FTDI)
 - Directional coupler setup that outputs one voltage between 0 and 3.3 V each for forward and reflected power
+- (Optional) DS18B20 temperature sensor, connected to pin IO14, if you want temperature readout
 
 Matthias DD1US uses the following components in his implementations, among others:
 
@@ -77,12 +78,21 @@ The wiring was done according to the picture shown further below.
 
 ### Software / Libraries
 
-- Arduino IDE
-- Project code: https://github.com/dl3hc/wt32powermeter
-- Libraries:
+- Arduino IDE (2.x recommended)
+- Project code: https://github.com/dl3hc/wt32_powermeter
+- Libraries that need to be installed manually:
   - WebServer_WT32_ETH01: https://github.com/dl3hc/WebServer_WT32_ETH01-fork
   - DallasTemperature
   - OneWire
+- Libraries that ship with the ESP32 Arduino core (no separate install needed):
+  - `ESPmDNS` -- used for `http://<hostname>.local` network discovery
+  - `ArduinoOTA` -- used for over-the-air firmware updates
+  - `esp_task_wdt` -- used for the watchdog timer
+
+  These three are only guaranteed to be available if you're on the classic ESP32 Arduino core
+  (2.x). If you're on core 3.x (IDF5-based), the watchdog init call in `setup()` uses a different
+  API signature and will need a small adjustment -- see the comment above
+  `esp_task_wdt_init(...)` in `wt32_powermeter.ino`.
 
 ## Downloading and Setting Up the Arduino IDE
 
@@ -97,15 +107,16 @@ The following steps are required to compile and upload the code to the board:
 3. Select the correct board in the Arduino IDE:  
    **Tools → Board → esp32 → ESP32 Dev Module**
 
-4. Install all required libraries:  
-   **Tools → Manage Libraries →** search for **WebServer_WT32_ETH01** and install it
+4. Install the required libraries:  
+   **Tools → Manage Libraries →** search for and install **WebServer_WT32_ETH01**,
+   **DallasTemperature**, and **OneWire** (see [Prerequisites](#prerequisites) above)
 
 ## Downloading the Software
 
 1. Download the code from the repository:  
-   `git clone https://github.com/dl3hc/wt32powermeter`
+   `git clone https://github.com/dl3hc/wt32_powermeter`
 
-2. Open the file `wt32powermeter.ino` in the Arduino IDE or start it by double-clicking it.
+2. Open the file `wt32_powermeter.ino` in the Arduino IDE, or start it by double-clicking it.
 
 ---
 
@@ -120,6 +131,12 @@ The following steps are required to compile and upload the code to the board:
 
 3. Click **Upload** (top left, arrow pointing to the right).
 
+This is the only way to get firmware onto a completely fresh board, and it always remains
+available afterward as a fallback -- USB upload talks directly to the ESP32's bootloader and
+does not depend on the network, OTA password, or any other part of the running application.
+See `HOWTO.md` for recovery instructions if the device becomes unreachable on the network or
+you forget the OTA password.
+
 ---
 
 ## Connecting the Board to the Directional Coupler
@@ -132,36 +149,37 @@ The two pins **IO0** and **GND** only need to be bridged during programming. Rem
 
 ## Configuration
 
-The following code blocks in `wt32powermeter.ino` can be adapted to your needs.
+The following code blocks in `wt32_powermeter.ino` can be adapted to your needs before flashing.
 
 ### Network Configuration
 
 ```cpp
-ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER);
-
-// Static IP, leave without this line to get IP via DHCP
-//ETH.config(myIP, myGW, mySN, myDNS);
-
-WT32_ETH01_waitForConnect();
-````
-
-By default, `wt32powermeter` is configured to obtain an IP address automatically via DHCP. If that is what you want, no changes are necessary.
-
-If you want to use a static IP, activate the following line by removing the two leading slashes:
-
-```cpp
-//ETH.config(myIP, myGW, mySN, myDNS);
-```
-
-Define the desired network configuration in the following block:
-
-```cpp
-// Select the IP address according to your local network
-IPAddress myIP(192, 168, 1, 100);
-IPAddress myGW(192, 168, 1, 1);
+IPAddress myIP(192, 168, 2, 198);
+IPAddress myGW(192, 168, 2, 1);
 IPAddress mySN(255, 255, 255, 0);
-IPAddress myDNS(192, 168, 1, 1);
+IPAddress myDNS(192, 168, 2, 1);
 ```
+
+```cpp
+ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER);
+ETH.config(myIP, myGW, mySN, myDNS);
+WT32_ETH01_waitForConnect();
+```
+
+By default the device uses the **static IP `192.168.2.198`** defined above -- `ETH.config(...)` is
+called unconditionally, so a static IP is always active out of the box. Adjust `myIP`/`myGW`/`mySN`/`myDNS`
+to match your network before flashing, or comment out the `ETH.config(myIP, myGW, mySN, myDNS);`
+line entirely if you'd rather obtain an address via DHCP instead.
+
+### mDNS Hostname
+
+```cpp
+String device_hostname = "powermeter";
+```
+
+Regardless of which IP the device ends up with, it's also reachable at `http://powermeter.local`
+via mDNS. Change `device_hostname` if you're running more than one unit on the same network, or
+prefer a different name -- this same name is also used to identify the device for OTA updates.
 
 ---
 
@@ -184,25 +202,39 @@ String band_list[] = { "1.25cm", "3cm", "6cm", "9cm", "13cm", "23cm", "70cm", "2
 
 ## Accessing the Web Interface
 
-Open the following address in your preferred browser:
+Open one of the following addresses in your preferred browser:
 
 ```text
 http://YOUR_IP_ADDRESS
 ```
-
-Example:
-
 ```text
-http://192.168.1.100
+http://powermeter.local
 ```
 
-The IP address is either the one defined in the code or one assigned dynamically via DHCP. If DHCP is used, you can find the address in your router dashboard under the connected network devices.
+Example, using the default static IP:
+
+```text
+http://192.168.2.198
+```
+
+The IP address is either the one defined in the code (default) or one assigned dynamically via
+DHCP if you switched to that mode. If DHCP is used, you can find the assigned address in your
+router's dashboard under connected devices, or just use the `.local` address instead.
+
+### First-time setup: OTA password
+
+The very first page you'll see is **not** the dashboard -- every unit ships with the same
+default OTA (over-the-air update) password, and the device refuses to serve the normal
+dashboard/config pages until you replace it with one of your own. Set a password (8+ characters)
+and submit the form; this only needs to be done once and takes effect immediately. See
+`HOWTO.md` for full details, including how to recover if you forget it.
 
 ---
 
 ## Usage
 
-The first step is to configure the connected directional couplers. To do this, click **Configuration** in the left footer of the page.
+Once the OTA password has been set, the dashboard is shown by default. To configure the
+connected directional couplers, click **Configuration** in the footer of the page.
 
 ![Usage](docs/remote-power-meter-10.png)
 
@@ -214,7 +246,7 @@ First, select the band you want to configure using the dropdown menu labeled **B
 
 The actual calibration values shown here are not important; they were used only for debugging purposes. For your own setup, you need to determine suitable values. Enter the `mV:dBm` value pairs for **FWD** and **REF** here, then click **Save Calibration Data**.
 
-You can enter the values in any order; manual sorting is not necessary. After saving, the data will be sorted automatically and displayed correctly.
+You can enter the values in any order; manual sorting is not necessary -- they're sorted automatically after saving and displayed correctly.
 
 ### How the calibration was performed in my setup
 
@@ -281,13 +313,51 @@ The following general configuration parameters are available to customize the ap
 * **Cable loss in dB (e.g. 3):**
   Sets the cable loss of your system, which is then taken into account in the calculations.
 
+* **Display average power instead of PEP (yes/no):**
+  Toggles between averaging the 50 ADC samples taken per reading, or using their peak value
+  (PEP-like behavior).
+
+* **Show temperature (yes/no):**
+  Enables or disables the temperature readout (requires a DS18B20 sensor on IO14).
+
+* **Display temperature in Celsius or Fahrenheit:**
+  Toggles the unit used for the temperature readout.
+
 After making the desired changes, click **Save Configuration**.
+
+---
+
+## Updating Firmware Over the Network (OTA)
+
+Once the OTA password has been set (see [First-time setup](#first-time-setup-ota-password) above):
+
+1. In the Arduino IDE, go to **Tools → Port** -- the device should appear under "Network Ports"
+   as `<hostname> at <ip>` (e.g. `powermeter at 192.168.2.198`).
+2. Select it, then **Upload** as normal. You'll be prompted for the OTA password.
+
+USB upload (see [Programming the Board](#programming-the-board) above) always remains available
+as a fallback, independent of the network or OTA password -- see `HOWTO.md` for full setup,
+update, and recovery instructions, including how to reset a forgotten OTA password.
+
+---
+
+## Reliability
+
+- A hardware watchdog automatically reboots the device if the main loop ever hangs, instead of
+  leaving it silently unresponsive.
+- A failure to mount the internal filesystem (used for calibration data) no longer prevents the
+  dashboard, network, or OTA from starting -- calibration features degrade gracefully instead.
 
 ---
 
 ## Warning / Disclaimer
 
-This software contains no security mechanisms at all. There is no input/output sanitization or validation. In addition, there is no authentication or authorization mechanism implemented. Any person or system inside the network can access the application, read and modify configuration values, and retrieve information about monitored devices.
+This software has minimal security mechanisms. The dashboard and configuration pages
+(calibration data, general settings, band selection) have **no authentication** -- any device on
+the same network can view and change them, though state-changing requests must at least be a
+proper form submission (accidental GET requests can no longer silently wipe your settings).
+Over-the-air firmware updates require a password that you must set on first use, but the default
+password is public (it's in this repository's source code), so make sure you actually change it.
 
 **Do not make the application publicly accessible. Do not expose it to the internet.**
 
@@ -297,4 +367,3 @@ If you are unhappy with the current state of the software, you are welcome to co
 
 ## Tags
 `#Arduino #ESP32 #HamRadio #Remote`
-
