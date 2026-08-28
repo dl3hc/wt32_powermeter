@@ -10,6 +10,40 @@ Special thanks to Matthias DD1US for support with the directional coupler setup,
 
 ## Changelog
 
+## v1.0.3
+
+- Fixed two compile-breaking bugs introduced by a prior commit, where a stray brace split
+  `millivolt_to_dbm()` and `handleDATA()` and orphaned code at file scope
+- Replaced the calibration lookup with a compact sorted point table instead of a dense
+  3300-entry array
+  - Cuts RAM usage by more than 90%
+  - Fixes a division-by-zero/NaN bug when a reading fell outside the calibrated range
+- Reduced power/SWR reading jitter
+  - Added smoothing (EMA) across polls and decorrelated ADC samples
+  - Sanitized NaN/Inf values in all displayed fields, not just Return Loss
+- Fixed a frontend bug where the LED bar graphs snapped to new values instead of animating
+  smoothly
+- Fixed a bug where saving the general configuration could send two HTTP responses for one
+  request
+- Reduced how often the temperature sensor blocks the web server (once every 5 seconds
+  instead of on every single page refresh)
+- Added safeguards against accidental data loss
+  - Calibration/configuration/band-selection endpoints now require a proper form submission
+    (a stray GET request, e.g. from a browser or crawler, can no longer wipe saved data)
+  - Invalid band names are now rejected instead of silently creating a new empty configuration
+- A failure to mount the internal filesystem no longer prevents the web server from starting
+- Added mDNS support: the device can be reached at `http://<hostname>.local` (hostname is
+  configurable in the code)
+- Added OTA (over-the-air) firmware updates over the network
+  - Protected by a password; on first use you are required to replace the default password
+    before the device becomes usable
+  - Updating via USB always remains available as a fallback (see the new `HOWTO.md`)
+- Added a watchdog timer that automatically reboots the device if it becomes unresponsive
+- Modernized the web dashboard and configuration page with a new dark, instrument-panel-style
+  visual design
+- Modernized the JavaScript code (network requests, LED bar graph rendering)
+- Added `HOWTO.md` with setup, OTA, and recovery instructions
+
 ## v1.0.2
 
 - Added rudimentary PEP implementation for testing
