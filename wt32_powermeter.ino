@@ -1,10 +1,14 @@
+#include <WebServer_WT32_ETH01.h>
+#include <WebServer_WT32_ETH01.hpp>
+
 /****************************************************************************************************************************
   Remote Power/SWR Meter - a solution to remotely measure RF power and VSWR over ethernet
 
   For Ethernet shields using WT32_ETH01 (ESP32 + LAN8720)
   Uses WebServer_WT32_ETH01, a library for the Ethernet LAN8720 in WT32_ETH01 to run WebServer
 
-  Author: Michael Clemens, DK1MI
+  Original author: Michael Clemens, DK1MI
+  Maintained by: DL3HC
   Licensed under GPLv3 license (see LICENSE.md)
 
   VU meter code was taken from https://github.com/tomnomnom/vumeter, credits go to Tom Hudson (https://github.com/tomnomnom)
@@ -65,6 +69,9 @@
 #include "SPIFFS.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <esp_task_wdt.h>
 
 
 /****************************************************************************************************************************
@@ -73,7 +80,41 @@
  *  version:
  *    Human-readable firmware version string used for UI display, debugging, and update tracking.
  ****************************************************************************************************************************/
-String version = "1.0.2";
+String version = "1.0.3";
+
+
+/****************************************************************************************************************************
+ *  NETWORK IDENTITY / RELIABILITY CONFIGURATION
+ *
+ *  device_hostname:
+ *    Used for mDNS (reachable as "<device_hostname>.local" instead of the hardcoded static IP)
+ *    and as the OTA update device name. Change this if running multiple units on one network.
+ *
+ *  WDT_TIMEOUT_SECONDS:
+ *    Hardware/task watchdog timeout. If the main loop doesn't check in within this window
+ *    (e.g. a hung network call), the device auto-reboots instead of staying wedged indefinitely --
+ *    important for a meter that's mounted somewhere you can't easily walk over and power-cycle.
+ ****************************************************************************************************************************/
+String device_hostname = "powermeter";
+const int WDT_TIMEOUT_SECONDS = 15;
+
+/****************************************************************************************************************************
+ *  OTA UPDATE PASSWORD
+ *
+ *  OTA_DEFAULT_PASSWORD:
+ *    Factory-default OTA password. Every unit ships with this same value, so it must not be
+ *    trusted as a real secret -- it exists only so ArduinoOTA has *some* password from the very
+ *    first boot (an unauthenticated OTA listener is a firmware-flashing backdoor for anyone on
+ *    the LAN). As long as the stored password still equals this default, the web UI refuses to
+ *    serve the normal dashboard/config pages and instead forces the user to set a real password
+ *    first (see ota_password_is_default() / build_ota_setup_page() / handleSETOTAPASS()).
+ *
+ *  ota_password:
+ *    The password actually in effect, loaded from NVS at boot (falling back to the default and
+ *    persisting it on first-ever boot). Kept in sync with NVS and with ArduinoOTA's own state.
+ ****************************************************************************************************************************/
+const char* OTA_DEFAULT_PASSWORD = "changeme";
+String ota_password = "";
 
 
 /****************************************************************************************************************************
@@ -111,18 +152,33 @@ String band_config_nice_names[] = { "Show voltage in mV (yes/no)", "Show power l
 
 
 /****************************************************************************************************************************
- *  RAW MEASUREMENT STORAGE BUFFERS
+ *  CALIBRATION TABLE STORAGE (mV -> dBm)
  *
- *  fwd_array / ref_array:
- *    Large circular/history buffers storing forward (FWD) and reflected (REF) RF measurements.
- *    Each entry represents a sampled ADC-derived value used for averaging, smoothing,
- *    or waveform-like visualization (VU meter behavior).
+ *  CalPoint:
+ *    One calibration point: a millivolt reading (mv) and the RF power level (dbm)
+ *    it corresponds to, as configured by the user in the calibration UI.
  *
- *  Size 3300:
- *    Indicates long-term sample history for smoothing and time-series analysis.
+ *  fwd_points / ref_points:
+ *    Sparse, sorted-by-mv arrays holding only the calibration points the user has
+ *    actually configured (typically a few dozen), instead of one slot per possible
+ *    millivolt value. fwd_point_count / ref_point_count track how many entries in
+ *    each array are valid. Kept sorted ascending by mv so millivolt_to_dbm() can
+ *    find the bracketing pair with a single forward scan.
+ *
+ *  MAX_CAL_POINTS:
+ *    Upper bound on configured calibration points per table. Far above any
+ *    realistic calibration curve; extra entries beyond this are ignored on load.
  ****************************************************************************************************************************/
-double fwd_array[3300] = {};
-double ref_array[3300] = {};
+struct CalPoint {
+  int16_t mv;
+  double dbm;
+};
+
+const int MAX_CAL_POINTS = 200;
+CalPoint fwd_points[MAX_CAL_POINTS];
+CalPoint ref_points[MAX_CAL_POINTS];
+int fwd_point_count = 0;
+int ref_point_count = 0;
 
 
 /****************************************************************************************************************************
@@ -399,72 +455,38 @@ double dbm_to_watt(double dbm) {
  *
  * Purpose:
  * Determines whether a given millivolt (ADC) value lies outside the calibrated range
- * defined by the first and last non-zero entries in the lookup table.
+ * defined by the lowest and highest configured calibration points.
  *
  * Behavior:
- * - Scans the selected lookup table (fwd_array or ref_array).
- * - Identifies the lowest and highest index positions containing valid data.
- * - Compares the input value against this valid range.
+ * - Looks at the selected sorted-by-mv point table (fwd_points or ref_points).
+ * - Since it's sorted, the lowest/highest configured mv are just the first/last entries.
  *
  * Parameters:
  * mv (int)
- *   Measured millivolt value (used as index into calibration table).
+ *   Measured millivolt value.
  *
  * fwd (bool)
  *   Selects which dataset to use:
- *   true  -> forward power table (fwd_array)
- *   false -> reflected power table (ref_array)
+ *   true  -> forward power table (fwd_points)
+ *   false -> reflected power table (ref_points)
  *
  * Returns:
  * bool
  *   false -> value is within calibrated bounds
- *   true  -> value is outside calibrated bounds
- *
- * Implementation details:
- * - A value of 0 in the table is treated as "unset / invalid entry".
- * - The function assumes that valid calibration data is continuous between bounds.
+ *   true  -> value is outside calibrated bounds (or no calibration points exist)
  **************************************************************************************************/
 bool is_val_out_of_bounds(int mv, bool fwd) {
-  double stored_val = 0;
-  int key_a = 0;
-  int key_b = 0;
+  CalPoint *pts = fwd ? fwd_points : ref_points;
+  int count = fwd ? fwd_point_count : ref_point_count;
 
-  // searches for the first key (voltage) that has a value (dBm)
-  for (int i = 0; i < 3300; i++) {
-    if (fwd) {
-      stored_val = fwd_array[i];
-    } else {
-      stored_val = ref_array[i];
-    }
-    if (stored_val != 0) {
-      key_a = i;
-      break;
-    }
-  }
-
-  // searches for the last key (voltage) that has a value (dBm)
-  for (int i = 3299; i > 0; i--) {
-    if (fwd) {
-      stored_val = fwd_array[i];
-    } else {
-      stored_val = ref_array[i];
-    }
-    if (stored_val != 0) {
-      key_b = i;
-      break;
-    }
-  }
-
-  int lowerkey = min(key_a, key_b);   // takes both values found above and assigns the lower key
-  int higherkey = max(key_a, key_b);  // takes both values found above and assigns the higher key
-
-  // returns false if given voltage is between the lowest and highest configured voltages
-  // returns true if voltage is out of bounds
-  if (lowerkey <= mv and mv <= higherkey)
-    return false;
-  else {
+  // no calibration data at all -> everything is "out of bounds"
+  if (count == 0) {
     return true;
   }
+
+  // pts[] is kept sorted ascending by mv, so the lowest/highest configured
+  // voltages are simply the first and last entries -- no scan needed.
+  return mv < pts[0].mv || mv > pts[count - 1].mv;
 }
 
 
@@ -472,191 +494,100 @@ bool is_val_out_of_bounds(int mv, bool fwd) {
  * Function: millivolt_to_dbm
  *
  * Purpose:
- * Converts a raw millivolt (ADC index) value into a corresponding dBm value
- * using a lookup table with linear interpolation between adjacent entries.
+ * Converts a raw millivolt (ADC) value into a corresponding dBm value using linear
+ * interpolation between the two nearest configured calibration points.
  *
  * Core concept:
- * The system stores calibration data as a mapping:
- *   millivolt index -> measured dBm value
- *
- * This function:
- * 1. Determines whether the table is ascending or descending.
- * 2. Finds the two nearest calibration points surrounding the input value.
- * 3. Prepares values for interpolation (actual interpolation occurs later in code).
+ * Calibration data is stored as a sorted-by-mv array of (mv, dbm) points
+ * (fwd_points / ref_points) holding only the points the user actually configured.
  *
  * Parameters:
  * mv (int)
- *   Input millivolt index to convert.
+ *   Input millivolt value to convert.
  *
  * fwd (bool)
- *   Selects dataset:
- *   true  -> forward power table (fwd_array)
- *   false -> reflected power table (ref_array)
+ *   Selects dataset: true -> forward power table (fwd_points), false -> reflected (ref_points).
  *
  * Returns:
  * double
- *   Corresponding dBm value (interpolated in subsequent logic).
- *
- * Important internal variables:
- * lastval / nextval
- *   Neighboring calibration dBm values used for interpolation.
- *
- * lastkey / nextkey
- *   Corresponding indices in the lookup table.
- *
- * ascending
- *   Indicates whether calibration data increases or decreases with index.
+ *   Interpolated dBm value. Clamped to the nearest real calibration point if mv falls
+ *   outside the calibrated range; 0 if the table has no calibration points at all.
  *
  * Notes:
- * - Zero entries are treated as invalid/uninitialized table slots.
- * - Table is assumed to contain monotonic or near-monotonic calibration data.
- * - Performance is O(n) due to full table scan.
+ * - pts[] is kept sorted ascending by mv, so a single forward scan finds the bracket.
+ * - "ascending" here means the calibration dBm values increase as mv increases; some
+ *   detectors have an inverse relationship, so both directions are handled.
+ * - Performance is O(n) in the number of *configured* calibration points (typically a
+ *   few dozen), not O(3300) like the previous dense-array implementation.
  **************************************************************************************************/
 double millivolt_to_dbm(int mv, bool fwd) {
-  double lastval = 0;
-  double nextval = 0;
-  int lastkey = 0;
-  int nextkey = 0;
-  double stored_val = 0;
-  bool ascending = true;
+  CalPoint *pts = fwd ? fwd_points : ref_points;
+  int count = fwd ? fwd_point_count : ref_point_count;
 
-  int lowest_key_in_table = 0;
-  int highest_key_in_table = 0;
+  if (count == 0) {
+    return 0;
+  }
+  if (count == 1) {
+    return pts[0].dbm;
+  }
 
-  // check if table is ascending or descending
-  double asc_tmp_val = 0;
-  for (int i = 0; i < 3300; i++) {
-    if (fwd) {
-      stored_val = fwd_array[i];
+  // Direction of the calibration curve: does dBm increase or decrease as mV increases?
+  bool ascending = pts[count - 1].dbm >= pts[0].dbm;
+
+  // Find the bracketing pair: last point with mv < input, next point with mv >= input.
+  bool have_lastval = false;
+  bool have_nextval = false;
+  int lastkey = 0, nextkey = 0;
+  double lastval = 0, nextval = 0;
+
+  for (int i = 0; i < count; i++) {
+    if (pts[i].mv < mv) {
+      lastkey = pts[i].mv;
+      lastval = pts[i].dbm;
+      have_lastval = true;
     } else {
-      stored_val = ref_array[i];
-    }
-    if (stored_val != 0) {
-      if (asc_tmp_val == 0) {
-        asc_tmp_val = stored_val;
-      } else if (stored_val > asc_tmp_val) {
-        ascending = true;
-        break;
-      } else if (stored_val < asc_tmp_val) {
-        ascending = false;
-        break;
-      }
+      nextkey = pts[i].mv;
+      nextval = pts[i].dbm;
+      have_nextval = true;
+      break;
     }
   }
-  // checks if the voltage values are opposite to the dBm values or
-  // if both, voltage and dBm values are ascending
+
+  // mv fell outside the calibrated range, or only one side of the
+  // interpolation pair was found: clamp to the nearest real calibration
+  // point instead of interpolating against a fabricated endpoint, which
+  // would otherwise divide by zero below.
+  if (!have_lastval) {
+    return nextval;
+  }
+  if (!have_nextval) {
+    return lastval;
+  }
+  if (lastkey == nextkey) {
+    return lastval;
+  }
+
+  // Linear interpolation between the two nearest real calibration points
+  // (lastkey/lastval and nextkey/nextval), normalized so the math works
+  // regardless of whether the table is stored ascending or descending.
+  double lowerkey = min(lastkey, nextkey);
+  double higherkey = max(lastkey, nextkey);
+
+  double lowerval = min(lastval, nextval);
+  double higherval = max(lastval, nextval);
+
+  double diffkey = higherkey - lowerkey;
+  double diffval = max(lastval, nextval) - min(lastval, nextval);
+
+  double result = 0;
+
   if (ascending) {
-    for (int i = 0; i < 3300; i++) {
-      if (fwd) {
-        stored_val = fwd_array[i];
-      } else {
-        stored_val = ref_array[i];
-      }
-      if (stored_val != 0) {
-        if (lowest_key_in_table == 0) {
-          lowest_key_in_table = i;  //finds the lowest voltage value stored in the table
-        }
-        highest_key_in_table = i;  // we will have the highest voltage value in the table at the end of the loop
-        if (i < mv) {
-          lastval = stored_val;
-          lastkey = i;
-        } else {
-          nextval = stored_val;
-          nextkey = i;
-          break;
-        }
-      }
-    }
+    result = lowerval + ((diffval / diffkey) * (mv - lowerkey));
   } else {
-    for (int i = 3300; i > 0; i--) {
-      if (fwd) {
-        stored_val = fwd_array[i];
-      } else {
-        stored_val = ref_array[i];
-      }
-      if (stored_val != 0) {
-        if (lowest_key_in_table == 0) {
-          lowest_key_in_table = i;  //finds the lowest voltage value stored in the table
-        }
-        highest_key_in_table = i;  // we will have the highest voltage value in the table at the end of the loop
-        if (i > mv) {
-          lastval = stored_val;
-          lastkey = i;
-        } else {
-          nextval = stored_val;
-          nextkey = i;
-          break;
-        }
-      }
-    }
+    result = higherval - ((diffval / diffkey) * (mv - lowerkey));
   }
-}
 
-/****************************************************************************************************************************
- *  LINEAR INTERPOLATION AND VALUE MAPPING LOGIC
- *
- *  This function performs piecewise linear interpolation between two calibration points.
- *  It is typically used in RF measurement systems to convert raw ADC millivolt readings
- *  into calibrated physical units (e.g., dBm).
- *
- *  INPUT VARIABLES (implicit from surrounding scope):
- *    lastkey  -> lower calibration key (e.g., lower mV reference point)
- *    nextkey  -> upper calibration key
- *    lastval  -> calibrated value corresponding to lastkey
- *    nextval  -> calibrated value corresponding to nextkey
- *    mv       -> current measured millivolt value to be mapped
- *    ascending-> direction flag indicating monotonicity of calibration curve
- *
- *  COMPUTATION STEPS:
- *
- *  1. Normalize key/value ordering:
- *     lowerkey  = min(lastkey, nextkey)
- *     higherkey = max(lastkey, nextkey)
- *     lowerval  = min(lastval, nextval)
- *     higherval = max(lastval, nextval)
- *
- *     This ensures robustness regardless of whether calibration points are stored
- *     in ascending or descending order.
- *
- *  2. Compute deltas:
- *     diffkey = |nextkey - lastkey|
- *     diffval = |nextval - lastval|
- *
- *     These define the slope of the calibration segment.
- *
- *  3. Linear interpolation:
- *     If ascending == true:
- *         result = lowerval + slope * (mv - lowerkey)
- *     Else:
- *         result = higherval - slope * (mv - lowerkey)
- *
- *     Where slope = diffval / diffkey
- *
- *  4. Return:
- *     The interpolated calibrated value corresponding to input mv.
- *
- *  NOTE:
- *    This is effectively a piecewise linear transfer function commonly used
- *    in sensor calibration curves for RF power detection.
- ****************************************************************************************************************************/
-double lowerkey = min(lastkey, nextkey);
-double higherkey = max(lastkey, nextkey);
-
-double lowerval = min(lastval, nextval);
-double higherval = max(lastval, nextval);
-
-double diffkey = max(lastkey, nextkey) - min(lastkey, nextkey);
-double diffval = max(lastval, nextval) - min(lastval, nextval);
-
-double result = 0;
-
-if (ascending) {
-  result = lowerval + ((diffval / diffkey) * (mv - lowerkey));
-} else {
-  result = higherval - ((diffval / diffkey) * (mv - lowerkey));
-}
-
-return result;
+  return result;
 }
 
 
@@ -742,17 +673,37 @@ void read_directional_couplers() {
     voltage_sum_ref += voltage_ref_now;
     voltage_fwd_max = max(voltage_fwd_now, voltage_fwd_max);
     voltage_ref_max = max(voltage_ref_now, voltage_ref_max);
+    // small settling delay so consecutive ADC samples aren't correlated
+    delayMicroseconds(100);
   }
 
+  int voltage_fwd_raw = 0;
+  int voltage_ref_raw = 0;
   if (config.getString(String("s_power_avg").c_str()) == "true") {
     // calculate the average value by deviding the above sum by 50
-    voltage_fwd = voltage_sum_fwd / 50;
-    voltage_ref = voltage_sum_ref / 50;
+    voltage_fwd_raw = voltage_sum_fwd / 50;
+    voltage_ref_raw = voltage_sum_ref / 50;
   } else {
     // take the highest value of the 50 samples
-    voltage_fwd = voltage_fwd_max;
-    voltage_ref = voltage_ref_max;
+    voltage_fwd_raw = voltage_fwd_max;
+    voltage_ref_raw = voltage_ref_max;
   }
+
+  // Exponential moving average across polls: smooths out ADC/detector jitter
+  // that would otherwise get amplified by steep calibration segments and
+  // show up as jumpy bars, without needing more calibration points.
+  static double voltage_fwd_ema = -1;
+  static double voltage_ref_ema = -1;
+  const double ema_alpha = 0.3;
+  if (voltage_fwd_ema < 0) {
+    voltage_fwd_ema = voltage_fwd_raw;
+    voltage_ref_ema = voltage_ref_raw;
+  } else {
+    voltage_fwd_ema = ema_alpha * voltage_fwd_raw + (1 - ema_alpha) * voltage_fwd_ema;
+    voltage_ref_ema = ema_alpha * voltage_ref_raw + (1 - ema_alpha) * voltage_ref_ema;
+  }
+  voltage_fwd = (int)round(voltage_fwd_ema);
+  voltage_ref = (int)round(voltage_ref_ema);
 
   // calculate the dBm value from the voltage based on the calibration table
   fwd_dbm = millivolt_to_dbm(voltage_fwd, true);
@@ -792,7 +743,101 @@ void read_directional_couplers() {
  *  - This approach reduces HTTP request overhead on constrained embedded systems (ESP32).
  *  - It trades modular frontend delivery for simplicity and lower client round-trip complexity.
  ****************************************************************************************************************************/
+/****************************************************************************************************************************
+ *  OTA PASSWORD SETUP GATE
+ *
+ *  ota_password_is_default():
+ *    True as long as the device is still using the factory-default OTA password. Every unit
+ *    ships with the same default, so leaving it in place means anyone on the LAN can push
+ *    firmware to the device via ArduinoOTA -- this is checked before serving the normal
+ *    dashboard/config pages to force a real password to be set on first LAN use.
+ *
+ *  build_ota_setup_page():
+ *    Renders a minimal, self-contained "set your OTA password" form. Deliberately independent
+ *    of the dashboard/config stylesheets (which assume their own page structure) so this page
+ *    works correctly even on a completely fresh device.
+ ****************************************************************************************************************************/
+bool ota_password_is_default() {
+  return ota_password == String(OTA_DEFAULT_PASSWORD);
+}
+
+String build_ota_setup_page(String error_msg) {
+  String html = "<!DOCTYPE html><html><meta charset=\"utf-8\">";
+  html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+  html += "<title>Set OTA Password</title><style>";
+  html += "body{background:#14181B;color:#E8E6E1;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
+  html += "display:flex;justify-content:center;padding:32px 16px;}";
+  html += ".card{max-width:420px;width:100%;background:#1B2024;border:1px solid #2E363B;border-top:3px solid #D97C4A;";
+  html += "border-radius:6px;padding:20px;}";
+  html += "h1{font-size:16px;margin:0 0 12px 0;}";
+  html += "p{font-size:13px;color:#8A9096;line-height:1.5;}";
+  html += "label{display:block;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin:14px 0 4px;}";
+  html += "input{width:100%;box-sizing:border-box;background:#14181B;color:#E8E6E1;border:1px solid #2E363B;border-radius:4px;padding:8px;font-size:14px;}";
+  html += "button{margin-top:16px;width:100%;background:#D97C4A;color:#14181B;border:none;border-radius:6px;padding:10px;font-size:13px;font-weight:700;cursor:pointer;}";
+  html += ".error{color:#FF5A45;font-size:13px;margin:12px 0 0;}";
+  html += "</style><div class=\"card\">";
+  html += "<h1>Set an OTA update password</h1>";
+  html += "<p>This device still uses the factory-default password for over-the-air firmware updates. "
+          "Since every unit ships with the same default, leaving it in place lets anyone on this network "
+          "flash new firmware to it. Set a password of your own to continue.</p>";
+  if (error_msg != "") {
+    html += "<p class=\"error\">" + error_msg + "</p>";
+  }
+  html += "<form method=\"POST\" action=\"/setotapass\">";
+  html += "<label for=\"newpass\">New OTA password (min. 8 characters)</label>";
+  html += "<input type=\"password\" id=\"newpass\" name=\"newpass\" minlength=\"8\" required>";
+  html += "<label for=\"confirmpass\">Confirm password</label>";
+  html += "<input type=\"password\" id=\"confirmpass\" name=\"confirmpass\" minlength=\"8\" required>";
+  html += "<button type=\"submit\">Set password</button>";
+  html += "</form></div></html>";
+  return html;
+}
+
+/****************************************************************************************************************************
+ *  HTTP HANDLER: handleSETOTAPASS
+ *
+ *  Validates and stores a new OTA password (must differ from the default, must be at least
+ *  8 characters, and must be entered twice identically), then hot-reloads ArduinoOTA with it
+ *  so the new password takes effect immediately without requiring a reboot.
+ ****************************************************************************************************************************/
+void handleSETOTAPASS() {
+  if (server.method() != HTTP_POST) {
+    server.send(200, "text/html", build_ota_setup_page(""));
+    return;
+  }
+
+  String newpass = server.arg("newpass");
+  String confirmpass = server.arg("confirmpass");
+
+  if (newpass.length() < 8) {
+    server.send(200, "text/html", build_ota_setup_page("Password must be at least 8 characters."));
+    return;
+  }
+  if (newpass != confirmpass) {
+    server.send(200, "text/html", build_ota_setup_page("Passwords did not match. Try again."));
+    return;
+  }
+  if (newpass == String(OTA_DEFAULT_PASSWORD)) {
+    server.send(200, "text/html", build_ota_setup_page("That is still the default password -- choose a different one."));
+    return;
+  }
+
+  ota_password = newpass;
+  global_config.putString(String("x_ota_pass").c_str(), ota_password);
+
+  // Hot-reload ArduinoOTA with the new password so it takes effect immediately.
+  ArduinoOTA.end();
+  ArduinoOTA.setPassword(ota_password.c_str());
+  ArduinoOTA.begin();
+
+  handleRoot();
+}
+
 void handleRoot() {
+  if (ota_password_is_default()) {
+    server.send(200, "text/html", build_ota_setup_page(""));
+    return;
+  }
   String html = MAIN_page;
   String css = DB_STYLESHEET;
   String js = JAVASCRIPT;
@@ -954,16 +999,29 @@ void handleDATA() {
   if (rl > 0) {
     rl_str = (String(rl));
   }
+
+  // A reading outside the calibrated range, or a malformed calibration
+  // table, can still surface as "nan"/"inf" in these derived strings.
+  // Sanitize all of them, not just rl_str, so a bad ADC sample never
+  // reaches the frontend as garbage text driving the LED bars.
+  fwd_dbm_str.replace("nan", "-- ");
+  ref_dbm_str.replace("nan", "-- ");
+  fwd_watt_str.replace("nan", "-- ");
+  ref_watt_str.replace("nan", "-- ");
+  fwd_dbm_str.replace("inf", "-- ");
+  ref_dbm_str.replace("inf", "-- ");
+  fwd_watt_str.replace("inf", "-- ");
+  ref_watt_str.replace("inf", "-- ");
   rl_str.replace("nan", "-- ");
+  rl_str.replace("inf", "-- ");
 
   String antenna_name = config.getString(String("s_ant_name").c_str());
   String vswr_beep = config.getString(String("b_vswr_beep").c_str());
 
   bool fwd_oob = is_val_out_of_bounds(voltage_fwd, true);
   bool ref_oob = is_val_out_of_bounds(voltage_ref, false);
-}
 
-/****************************************************************************************************************************
+  /****************************************************************************************************************************
  *  RESPONSE SERIALIZATION FOR FRONTEND COMMUNICATION
  *
  *  This code block constructs a single semicolon-separated payload string that is transmitted
@@ -981,82 +1039,32 @@ void handleDATA() {
  ****************************************************************************************************************************/
 
 
-// Generate a semicolon seperated string that will be sent to the frontend
-String output = fwd_watt_str + ";";                                   // data[0]: FWD power in Watt
-// Appends forward power in watts as the first telemetry field. This is a derived value
-// computed from RF detector measurements and formatted as a string for transmission.
+  // Generate a semicolon separated string that will be sent to the frontend
+  String output = fwd_watt_str + ";";                                   // data[0]: FWD power in Watt
+  output += fwd_dbm_str + ";";                                          // data[1]: FWD dBm value
+  output += voltage_fwd_str + ";";                                      // data[2]: FWD voltage
+  output += ref_watt_str + ";";                                         // data[3]: REF power in Watt
+  output += ref_dbm_str + ";";                                          // data[4]: REF dBm value
+  output += voltage_ref_str + ";";                                      // data[5]: REF voltage
+  output += vswr_str + ";";                                             // data[6]: VSWR value
+  output += rl_str + ";";                                               // data[7]: RL value
+  output += band + ";";                                                 // data[8]: band (e.g. "70cm")
+  output += String(vswr_threshold) + ";";                               // data[9]: VSWR threshold (e.g. "3")
+  output += antenna_name + ";";                                         // data[10]: Name of antenna (e.g. "X200")
+  output += vswr_beep + ";";                                            // data[11]: should it beep if VSWR is too high? (true/false)
+  output += config.getString(String("s_max_led_pwr_f").c_str()) + ";";  // data[12]: highest value in Watt for the FWD LED graph (e.g. "100")
+  output += config.getString(String("s_max_led_pwr_r").c_str()) + ";";  // data[13]: highest value in Watt for the REF LED graph (e.g. "1")
+  output += config.getString(String("s_max_led_vswr").c_str()) + ";";   // data[14]: highest value in Watt for the VSWR LED graph (e.g. "3")
+  output += String(fwd_oob) + ";";                                      // data[15]: Is the FWD voltage out of bounds? (true/false)
+  output += String(ref_oob) + ";";                                      // data[16]: Is the REF voltage out of bounds? (true/false)
+  output += config.getString(String("b_show_led_fwd").c_str()) + ";";   // data[17]: Show the FWD LED bar graph? (true/false)
+  output += config.getString(String("b_show_led_ref").c_str()) + ";";   // data[18]: Show the REF LED bar graph? (true/false)
+  output += config.getString(String("b_show_led_vswr").c_str()) + ";";  // data[19]: Show the VSWR LED bar graph? (true/false)
+  output += version + ";";                                              // data[20]: program version
+  output += getTemp();                                                  // data[21]: temperature (final field, no trailing ';')
 
-output += fwd_dbm_str + ";";                                          // data[1]: FWD dBm value
-// Appends forward power expressed in dBm. This is a logarithmic representation of RF power,
-// typically derived from voltage readings via calibration curves.
-
-output += voltage_fwd_str + ";";                                      // data[2]: FWD voltage
-// Raw or scaled ADC voltage corresponding to the forward RF detector input channel.
-
-output += ref_watt_str + ";";                                         // data[3]: REF power in Watt
-// Reflected power expressed in watts, representing power not absorbed by the load.
-
-output += ref_dbm_str + ";";                                          // data[4]: REF dBm value
-// Reflected RF power in dBm, providing logarithmic scaling for reflected signal strength.
-
-output += voltage_ref_str + ";";                                      // data[5]: REF voltage
-// ADC voltage corresponding to the reflected RF detector input channel.
-
-output += vswr_str + ";";                                             // data[6]: VSWR value
-// Voltage Standing Wave Ratio (VSWR), computed from forward and reflected power ratio.
-// Indicates impedance matching quality of the transmission line.
-
-output += rl_str + ";";                                               // data[7]: RL value
-// Return Loss (RL) in dB, derived from reflection coefficient.
-// Higher values indicate better impedance matching.
-
-output += band + ";";                                                 // data[8]: band (e.g. "70cm")
-// Current operating frequency band identifier used for labeling and configuration scope.
-
-output += String(vswr_threshold) + ";";                               // data[9]: VSWR threshold (e.g. "3")
-// Configured alarm threshold for VSWR. Values above this trigger warning behavior.
-
-output += antenna_name + ";";                                         // data[10]: Name of antenna (e.g. "X200")
-// User-defined antenna identifier used for UI display and configuration context.
-
-output += vswr_beep + ";";                                            // data[11]: should it beep if VSWR is too high? (true/false)
-// Boolean flag controlling audible alarm behavior when VSWR exceeds threshold.
-
-output += config.getString(String("s_max_led_pwr_f").c_str()) + ";";  // data[12]: highest value in Watt for the FWD LED graph (e.g. "100")
-// Upper bound scaling parameter for forward power LED bar visualization.
-
-output += config.getString(String("s_max_led_pwr_r").c_str()) + ";";  // data[13]: highest value in Watt for the REF LED graph (e.g. "1")
-// Upper bound scaling parameter for reflected power LED bar visualization.
-
-output += config.getString(String("s_max_led_vswr").c_str()) + ";";   // data[14]: highest value in Watt for the VSWR LED graph (e.g. "3")
-// Upper bound scaling parameter for VSWR LED visualization scaling.
-
-output += String(fwd_oob) + ";";                                      // data[15]: Is the FWD voltage out of bounds? (true/false)
-// Status flag indicating whether forward detector input is outside calibrated or safe range.
-
-output += String(ref_oob) + ";";                                      // data[16]: Is the REF voltage out of bounds? (true/false)
-// Status flag indicating whether reflected detector input is outside calibrated or safe range.
-
-output += config.getString(String("b_show_led_fwd").c_str()) + ";";   // data[17]: Show the FWD LED bar graph? (true/false)
-// UI configuration flag controlling visibility of forward power LED bar graph.
-
-output += config.getString(String("b_show_led_ref").c_str()) + ";";   // data[18]: Show the REF LED bar graph? (true/false)
-// UI configuration flag controlling visibility of reflected power LED bar graph.
-
-output += config.getString(String("b_show_led_vswr").c_str()) + ";";  // data[19]: Show the VSWR LED bar graph? (true/false)
-// UI configuration flag controlling visibility of VSWR LED bar graph.
-
-output += version + ";";                                              // data[20]: program version
-// Firmware version string used for UI synchronization and diagnostic traceability.
-
-output += getTemp();                                                  // data[21]: temperature
-// Appends current temperature reading from the attached sensor subsystem.
-// This is the final field and intentionally not followed by a semicolon
-// to terminate the payload string cleanly.
-
-server.send(200, "text/plane", output);
-// Sends the constructed semicolon-delimited payload to the HTTP client.
-// MIME type "text/plane" (note: non-standard spelling) is used for lightweight plaintext transmission.
+  server.send(200, "text/plain", output);
+}
 
 /****************************************************************************************************************************
  *  handleCONFIG()
@@ -1080,6 +1088,10 @@ server.send(200, "text/plane", output);
 // main function for displaying the configuration page
 // invoked by the "configuration" button on the dashboard page
 void handleCONFIG() {
+  if (ota_password_is_default()) {
+    server.send(200, "text/html", build_ota_setup_page(""));
+    return;
+  }
 
   /**************************************************************************************************************************
    *  LAZY INITIALIZATION OF UI COMPONENTS
@@ -1229,23 +1241,19 @@ void handleCONFIG() {
  *         Reads calibration text files from flash filesystem into String buffers.
  *
  *    2. clear_fwd_ref_array()
- *         Resets global calibration arrays (fwd_array, ref_array) to a known empty state.
+ *         Resets the calibration point counts (fwd_point_count, ref_point_count) to 0.
  *
  *    3. save_string_to_array(...)
- *         Parses the loaded calibration strings and populates the numeric arrays:
- *           - fwd_array[] for forward calibration curve
- *           - ref_array[] for reflected calibration curve
+ *         Parses the loaded calibration strings into sorted-by-mv point arrays:
+ *           - fwd_points[] / fwd_point_count for the forward calibration curve
+ *           - ref_points[] / ref_point_count for the reflected calibration curve
  *
  *    4. HTML generation loop
- *         Iterates over the full fixed-size arrays and formats each non-zero entry as:
- *           "index:value"
- *         appended line-by-line into HTML textarea elements.
+ *         Iterates over just the configured points (fwd_point_count / ref_point_count)
+ *         and formats each as "mv:dbm", appended line-by-line into HTML textarea elements.
  *
  *  IMPORTANT IMPLEMENTATION DETAIL
- *    - The loop uses:
- *        sizeof fwd_array / sizeof fwd_array[0]
- *      to determine array length at compile time.
- *    - Only non-zero values are rendered, meaning sparse calibration entries are allowed.
+ *    - Only configured points are rendered; there is no fixed-size scan.
  *
  *  OUTPUT FORMAT (WEB UI)
  *    The generated HTML consists of:
@@ -1268,13 +1276,14 @@ void handleCONFIG() {
  *    - This variable is later injected into the web UI rendering pipeline
  *
  *  MEMORY / PERFORMANCE CHARACTERISTICS
- *    - Array size is fixed (FWD/REF buffers are large, ~3300 entries),
- *      so HTML generation may be moderately expensive in embedded context.
+ *    - Point arrays are sparse (only configured points are stored), so HTML generation
+ *      cost scales with the number of calibration points actually configured, not a
+ *      fixed 3300-entry scan.
  *    - No streaming output is used; full HTML is constructed in RAM as a String.
  *
  *  SIDE EFFECTS
  *    - Reads from SPIFFS filesystem
- *    - Mutates global arrays: fwd_array, ref_array
+ *    - Mutates global point arrays: fwd_points, ref_points (and their counts)
  *    - Mutates global UI state: conf_textareas
  *
  ****************************************************************************************************************************/
@@ -1284,26 +1293,22 @@ void build_textareas() {
 
   clear_fwd_ref_array();
 
-  save_string_to_array(fwd, fwd_array);
-  save_string_to_array(ref, ref_array);
+  save_string_to_array(fwd, fwd_points, fwd_point_count);
+  save_string_to_array(ref, ref_points, ref_point_count);
 
   String tbl = "<form action=\"/modcal\" method=\"POST\">";
   tbl += "<table class='styled-table'>";
   tbl += "<thead><tr><td>" + band + " FWD (mV:dBm)</td><td>" + band + " REF (mV:dBm)</td></tr></thead>";
   tbl += "<tr><td>";
   tbl += "<textarea id='fwd_textarea' name='fwd_textarea' rows='22'>";
-  for (int i = 0; i < sizeof fwd_array / sizeof fwd_array[0]; i++) {
-    if (fwd_array[i] != 0) {
-      tbl += String(i) + ":" + String(fwd_array[i], 5) + "\n";
-    }
+  for (int i = 0; i < fwd_point_count; i++) {
+    tbl += String(fwd_points[i].mv) + ":" + String(fwd_points[i].dbm, 5) + "\n";
   }
   tbl += "</textarea>";
   tbl += "</td><td>";
   tbl += "<textarea id='ref_textarea' name='ref_textarea' rows='22'>";
-  for (int i = 0; i < sizeof ref_array / sizeof ref_array[0]; i++) {
-    if (ref_array[i] != 0) {
-      tbl += String(i) + ":" + String(ref_array[i], 5) + "\n";
-    }
+  for (int i = 0; i < ref_point_count; i++) {
+    tbl += String(ref_points[i].mv) + ":" + String(ref_points[i].dbm, 5) + "\n";
   }
   tbl += "</textarea>";
   tbl += "</td></tr></table>";
@@ -1337,7 +1342,12 @@ void build_textareas() {
  *         - Otherwise           → text input field
  *  5. Uses human-readable labels from `band_config_nice_names` for UI presentation.
  *  6. Finalizes the table and appends a submit button to persist configuration changes.
- *  7. Calls `handleCONFIG()` to process or render the generated configuration view.
+ *
+ *  This function only populates `conf_config_table`; it does not send an HTTP response.
+ *  Callers are responsible for calling handleCONFIG() afterward if a response should be
+ *  sent (handleCONFIG() itself does this when lazily filling an empty cache; handleMODCFG()
+ *  does it explicitly after saving). Previously this function called handleCONFIG() itself,
+ *  which caused handleCONFIG()'s cache-fill path to send two HTTP responses per request.
  *
  *  IMPORTANT DESIGN BEHAVIOR
  *  - The function performs lazy initialization of missing configuration keys.
@@ -1351,7 +1361,6 @@ void build_textareas() {
  *  SIDE EFFECTS
  *  - May write default values into persistent NVS storage if keys are missing.
  *  - Mutates global string `conf_config_table`.
- *  - Triggers `handleCONFIG()` at the end, which likely controls HTTP response flow.
  *
  *  LIMITATIONS / IMPLICIT ASSUMPTIONS
  *  - No HTML escaping is performed on stored values (potential injection surface if inputs are untrusted).
@@ -1384,7 +1393,6 @@ void build_config_table() {
     }
   }
   conf_config_table += "</table><button class='button' value='save' name='save' type='submit'>Save Configuration</button></form>";
-  handleCONFIG();
 }
 
 /****************************************************************************************************************************
@@ -1398,7 +1406,7 @@ void build_config_table() {
  *
  *  The function acts as a bridge between:
  *    - Web UI input (textarea-based calibration data)
- *    - Internal runtime calibration arrays (fwd_array / ref_array)
+ *    - Internal runtime calibration point arrays (fwd_points / ref_points)
  *    - Persistent storage in SPIFFS filesystem
  *
  *  INPUT SOURCES
@@ -1426,16 +1434,15 @@ void build_config_table() {
  *     - This prevents mixing old and newly submitted calibration values.
  *
  *  3. ARRAY POPULATION
- *     - save_string_to_array() parses the textual calibration input
- *       and writes numeric values into:
- *         fwd_array[]
- *         ref_array[]
+ *     - save_string_to_array() parses the textual calibration input into sorted
+ *       point arrays:
+ *         fwd_points[] / fwd_point_count
+ *         ref_points[] / ref_point_count
  *
  *  4. SERIALIZATION FOR PERSISTENCE (FWD)
- *     - The forward array is serialized into a string format:
- *         "index:value"
- *       one entry per line.
- *     - Only non-zero values are included to reduce storage usage.
+ *     - The forward point array is serialized into a string format:
+ *         "mv:dbm"
+ *       one entry per line, for every configured point.
  *     - Values are formatted with 5 decimal places for precision consistency.
  *     - The resulting string is written to SPIFFS:
  *         /<band>fwd.txt
@@ -1465,38 +1472,44 @@ void build_config_table() {
  *  DESIGN NOTES / BEHAVIORAL CHARACTERISTICS
  *  -----------------------------------------
  *  - This function fully overwrites existing calibration data for the selected band.
- *  - Zero-valued entries are treated as "empty" and are not persisted.
+ *  - A calibration point of exactly 0 dBm is a valid, persisted point (unlike the old
+ *    dense-array implementation, which could not distinguish 0 dBm from "unset").
  *  - Calibration resolution and accuracy depend on save_string_to_array() parsing logic.
- *  - The function assumes global state: `band`, `fwd_array`, `ref_array`, and `server`.
+ *  - The function assumes global state: `band`, `fwd_points`, `ref_points`, and `server`.
  *
  *  SIDE EFFECTS
  *  ------------
- *  - Modifies global arrays: fwd_array, ref_array
+ *  - Modifies global point arrays: fwd_points, ref_points
  *  - Writes files to SPIFFS filesystem
  *  - Triggers UI regeneration and config page reload
  *  - Performs full replacement of calibration dataset for the active band
  *
  ****************************************************************************************************************************/
 void handleMODCAL() {
+  // Guard against accidental/malformed GET requests (link prefetch, crawlers,
+  // typed URLs): this endpoint is only meant to be reached via the calibration
+  // form's POST. A GET here would otherwise wipe all calibration data for the
+  // current band with empty textarea values.
+  if (server.method() != HTTP_POST) {
+    handleCONFIG();
+    return;
+  }
+
   String fwd = server.arg("fwd_textarea") + "\n";
   String ref = server.arg("ref_textarea") + "\n";
   clear_fwd_ref_array();
-  save_string_to_array(fwd, fwd_array);
-  save_string_to_array(ref, ref_array);
+  save_string_to_array(fwd, fwd_points, fwd_point_count);
+  save_string_to_array(ref, ref_points, ref_point_count);
 
   String fwd_of_array = "";
-  for (int i = 0; i < sizeof fwd_array / sizeof fwd_array[0]; i++) {
-    if (fwd_array[i] != 0) {
-      fwd_of_array += String(i) + ":" + String(fwd_array[i], 5) + "\n";
-    }
+  for (int i = 0; i < fwd_point_count; i++) {
+    fwd_of_array += String(fwd_points[i].mv) + ":" + String(fwd_points[i].dbm, 5) + "\n";
   }
   writeFile(SPIFFS, String("/" + band + "fwd.txt").c_str(), fwd_of_array.c_str());
 
   String ref_of_array = "";
-  for (int i = 0; i < sizeof ref_array / sizeof ref_array[0]; i++) {
-    if (ref_array[i] != 0) {
-      ref_of_array += String(i) + ":" + String(ref_array[i], 5) + "\n";
-    }
+  for (int i = 0; i < ref_point_count; i++) {
+    ref_of_array += String(ref_points[i].mv) + ":" + String(ref_points[i].dbm, 5) + "\n";
   }
   writeFile(SPIFFS, String("/" + band + "ref.txt").c_str(), ref_of_array.c_str());
 
@@ -1508,29 +1521,17 @@ void handleMODCAL() {
  *  FUNCTION: clear_fwd_ref_array
  *
  *  PURPOSE:
- *    Resets the complete history buffers for forward (FWD) and reflected (REF) RF measurements.
+ *    Resets the forward (FWD) and reflected (REF) calibration point tables.
  *
  *  BEHAVIOR:
- *    - Iterates over both global arrays fwd_array[] and ref_array[].
- *    - Sets every element in both arrays to 0.0.
- *    - Effectively clears all stored measurement history data.
- *
- *  TECHNICAL DETAILS:
- *    - Array length is derived at runtime using:
- *        sizeof(fwd_array) / sizeof(fwd_array[0])
- *      This ensures the loop automatically matches the declared buffer size.
- *
- *    - Both arrays are assumed to be parallel structures:
- *        fwd_array[x] → forward power sample at index x
- *        ref_array[x] → reflected power sample at same index x
- *
- *    - No bounds checking is required because iteration is strictly limited
- *      to the compile-time known array size.
+ *    - Sets fwd_point_count and ref_point_count to 0.
+ *    - The underlying fwd_points[]/ref_points[] contents are left as-is but are no
+ *      longer considered valid, since every reader is bounded by the point count.
  *
  *  SIDE EFFECTS:
- *    - All previously recorded RF measurement data is permanently lost.
- *    - Any running averaging, smoothing, or visualization logic depending on
- *      these buffers will immediately reset to zero state.
+ *    - The in-memory calibration tables are cleared; callers are expected to
+ *      immediately repopulate them via save_string_to_array() (build_textareas()
+ *      and handleMODCAL() both do this).
  *
  *  TYPICAL USE CASES:
  *    - Device reset or reinitialization
@@ -1538,109 +1539,79 @@ void handleMODCAL() {
  *    - User-triggered "clear history" action in web interface
  *****************************************************************************************************************************/
 void clear_fwd_ref_array() {
-  for (int x = 0; x < sizeof(fwd_array) / sizeof(fwd_array[0]); x++) {
-    fwd_array[x] = 0;
-    ref_array[x] = 0;
-  }
+  fwd_point_count = 0;
+  ref_point_count = 0;
 }
 
 /****************************************************************************************************************************
  *  save_string_to_array
  *
  *  PURPOSE
- *  This function parses a structured text representation of a calibration table (received from the frontend UI)
- *  and converts it into a numeric lookup array of type double.
+ *  Parses the "key:value" calibration text (from the frontend textarea, or a file loaded from
+ *  SPIFFS) into a sorted-by-mv array of CalPoint entries.
  *
- *  INPUT FORMAT ASSUMPTION
- *  The function expects `table_data` to contain multiple rows separated by newline characters ('\n').
- *  Each row is expected to contain one or more key-value pairs in the format:
- *
- *      key:value
- *
- *  where:
- *      - key   is an integer index used as the array position
- *      - value is a floating-point number stored at arr[key]
- *
- *  Multiple key-value pairs may exist per row, separated by newline or repeated delimiters.
+ *  INPUT FORMAT
+ *  `table_data` contains rows separated by '\n', each in the form "mv:dbm", e.g.:
+ *      0:0.12345
+ *      1500:23.4
  *
  *  PARAMETERS
- *  table_data
- *      A String containing the serialized calibration table coming from the web frontend.
+ *  table_data - serialized calibration table text.
+ *  arr[]      - destination CalPoint array (fwd_points or ref_points).
+ *  count      - output parameter: number of valid points written into arr[].
  *
- *  arr
- *      Target array of type double where parsed values are stored.
- *      The index of each value is determined by the parsed integer key.
- *
- *  INTERNAL VARIABLES
- *  r
- *      Start index of the current row within the input string.
- *
- *  t
- *      Row counter (currently unused for logic; may have been intended for diagnostics or debugging).
- *
- *  i
- *      Iteration index over the entire input string.
- *
- *  row
- *      Substring representing a single line (row) extracted from the input.
- *
- *  r2
- *      Start index within a row for parsing key-value segments.
- *
- *  t2
- *      Counter for parsed key-value pairs per row (not used outside function scope).
- *
- *  key
- *      Integer index extracted from the substring before ':'.
- *      Used directly as array index into `arr`.
- *
- *  val
- *      Floating-point value extracted from substring after ':'.
- *      Stored into arr[key].
- *
- *  OPERATIONAL BEHAVIOR
- *  1. The function scans the full input string character by character.
- *  2. Each newline character indicates the end of a row.
- *  3. Each row is extracted via substring(r, i).
- *  4. Within each row, the function scans for ':' delimiters.
- *  5. For each "key:value" pair:
- *         - key is parsed as integer
- *         - value is parsed as double
- *         - arr[key] is assigned value
- *
- *  EDGE CASES / IMPLICIT BEHAVIOR
- *  - Empty rows or rows with length <= 1 are ignored.
- *  - No bounds checking is performed on `key`, so invalid indices may corrupt memory.
- *  - Malformed numeric strings will be converted to 0 by toInt()/toDouble().
- *  - The condition `i == table_data.length()` inside the loop is logically unreachable
- *    because loop termination occurs at i < length; it remains harmless but redundant.
- *
- *  COMPLEXITY
- *  Time complexity: O(n * m) in worst case (n = input length, m = average row length)
- *  Space complexity: O(1) additional (aside from temporary String objects created via substring)
+ *  BEHAVIOR
+ *  - Rows without a valid "mv:dbm" pair, or with mv outside the plausible ADC range
+ *    (0..4095 mV), are skipped rather than corrupting memory.
+ *  - A repeated mv value overwrites the earlier point for that mv (upsert), matching the
+ *    "last one wins" behavior of the original dense-array implementation.
+ *  - Once all rows are parsed, the array is sorted ascending by mv so millivolt_to_dbm()
+ *    can find the interpolation bracket with a single forward scan.
+ *  - Points beyond MAX_CAL_POINTS are ignored (a generous cap; real calibration curves need
+ *    only a few dozen points).
  ****************************************************************************************************************************/
-void save_string_to_array(String table_data, double arr[]) {
-  int r = 0, t = 0;
-  for (int i = 0; i < table_data.length(); i++) {
-    if (table_data[i] == '\n' || i == table_data.length()) {
+void save_string_to_array(String table_data, CalPoint arr[], int &count) {
+  count = 0;
+  int r = 0;
+  for (int i = 0; i <= table_data.length(); i++) {
+    if (i == table_data.length() || table_data[i] == '\n') {
       if (i - r > 1) {
         String row = table_data.substring(r, i);
-        t++;
-        int r2 = 0, t2 = 0;
-        for (int j = 0; j < row.length(); j++) {
-          if (row[j] == ':' || row[j] == '\n') {
-            if (j - r2 > 1) {
-              int key = row.substring(r2, j).toInt();
-              double val = row.substring(j + 1).toDouble();
-              arr[key] = val;
-              t2++;
+        int sep = row.indexOf(':');
+        if (sep > 0) {
+          int key = row.substring(0, sep).toInt();
+          double val = row.substring(sep + 1).toDouble();
+          if (key >= 0 && key <= 4095) {
+            int existing = -1;
+            for (int k = 0; k < count; k++) {
+              if (arr[k].mv == key) {
+                existing = k;
+                break;
+              }
             }
-            r2 = (j + 1);
+            if (existing >= 0) {
+              arr[existing].dbm = val;
+            } else if (count < MAX_CAL_POINTS) {
+              arr[count].mv = key;
+              arr[count].dbm = val;
+              count++;
+            }
           }
         }
       }
       r = (i + 1);
     }
+  }
+
+  // insertion sort ascending by mv (count is small, so O(n^2) is negligible)
+  for (int a = 1; a < count; a++) {
+    CalPoint tmp = arr[a];
+    int b = a - 1;
+    while (b >= 0 && arr[b].mv > tmp.mv) {
+      arr[b + 1] = arr[b];
+      b--;
+    }
+    arr[b + 1] = tmp;
   }
 }
 
@@ -1680,13 +1651,22 @@ void save_string_to_array(String table_data, double arr[]) {
 // UI update step:
 //   - After updating all configuration keys, the cached HTML configuration
 //     table string is cleared.
-//   - build_config_table() is called to regenerate the UI representation
-//     based on updated persistent values.
+//   - build_config_table() regenerates conf_config_table from updated persistent values.
+//   - handleCONFIG() is then called explicitly to actually send the HTTP response
+//     (build_config_table() itself only populates the cache, it does not respond).
 //
 // Complexity:
 //   - O(n) over number of configuration keys, where n = sizeof(band_config_items).
 // =============================================================================
 void handleMODCFG() {
+  // Guard against accidental/malformed GET requests: a GET here would blank
+  // every non-boolean config value (empty server.arg()) and set every
+  // boolean config value to "false" (missing checkbox args).
+  if (server.method() != HTTP_POST) {
+    handleCONFIG();
+    return;
+  }
+
   for (int i = 0; i < sizeof band_config_items / sizeof band_config_items[0]; i++) {
     if (!server.hasArg(band_config_items[i]) and band_config_items[i].startsWith("b_")) {
       config.putString(band_config_items[i].c_str(), "false");
@@ -1698,6 +1678,7 @@ void handleMODCFG() {
   }
   conf_config_table = "";
   build_config_table();
+  handleCONFIG();
 }
 
 /****************************************************************************************************************************
@@ -1771,7 +1752,30 @@ void handleMODCFG() {
  *  - Triggers configuration UI regeneration via handleCONFIG().
  ****************************************************************************************************************************/
 void handleBAND() {
-  band = server.arg("bands");
+  // Guard against accidental/malformed GET requests: a GET here (empty
+  // "bands" arg) would persist an empty band name and open a NVS namespace
+  // for it, corrupting the selected-band state.
+  if (server.method() != HTTP_POST) {
+    handleCONFIG();
+    return;
+  }
+
+  String requested_band = server.arg("bands");
+  bool valid_band = false;
+  for (int i = 0; i < sizeof band_list / sizeof band_list[0]; i++) {
+    if (band_list[i] == requested_band) {
+      valid_band = true;
+      break;
+    }
+  }
+  if (!valid_band) {
+    // Unknown/malformed band name: ignore the request rather than creating
+    // an orphaned "config_<garbage>" NVS namespace.
+    handleCONFIG();
+    return;
+  }
+
+  band = requested_band;
   band_fwd = band + "_fwd";
   band_ref = band + "_ref";
   global_config.putString(String("x_selected_band").c_str(), band);
@@ -1814,15 +1818,12 @@ void handleBAND() {
  *        Only explicit string "false" switches to Fahrenheit mode.
  *
  *  Sensor behavior:
- *    - sensors.requestTemperatures()
- *        Triggers a blocking temperature conversion on the OneWire bus.
- *        All connected sensors perform a measurement cycle.
- *
- *    - sensors.getTempCByIndex(0)
- *        Reads the first detected sensor in Celsius.
- *
- *    - sensors.getTempFByIndex(0)
- *        Reads the first detected sensor in Fahrenheit.
+ *    - sensors.requestTemperatures() triggers a blocking ~750ms conversion (12-bit
+ *      default resolution). Since this function is called on every /readDATA poll
+ *      and the web server is single-threaded, a fresh conversion is only requested
+ *      at most once every TEMP_REFRESH_INTERVAL_MS (5s); the cached Celsius/Fahrenheit
+ *      values (last_temp_c / last_temp_f, static locals) are served on polls in between.
+ *    - sensors.getTempCByIndex(0) / getTempFByIndex(0) read the first detected sensor.
  *
  *  Validity filtering:
  *    - The function checks `temp_float > -100` as a heuristic validity gate.
@@ -1844,23 +1845,43 @@ void handleBAND() {
 String getTemp() {
   String ret = "";
   if (config.getString(String("b_show_temp").c_str()) == "true") {
+    // sensors.requestTemperatures() blocks for ~750ms per DS18B20 conversion
+    // (12-bit default resolution). getTemp() is called on every /readDATA poll,
+    // and the web server is single-threaded, so doing a fresh conversion every
+    // poll stalls the whole server for most of a second, once per poll -- making
+    // poll cadence (and therefore the dashboard) irregular. Temperature changes
+    // slowly, so only re-convert on a timer and serve the cached reading between
+    // refreshes.
+    static const unsigned long TEMP_REFRESH_INTERVAL_MS = 5000;
+    static unsigned long last_temp_read_ms = 0;
+    static bool have_temp_reading = false;
+    static float last_temp_c = -127;
+    static float last_temp_f = -127;
+
+    if (!have_temp_reading || millis() - last_temp_read_ms >= TEMP_REFRESH_INTERVAL_MS) {
+      sensors.requestTemperatures();
+      last_temp_c = sensors.getTempCByIndex(0);
+      last_temp_f = sensors.getTempFByIndex(0);
+      last_temp_read_ms = millis();
+      have_temp_reading = true;
+    }
+
     String label = "Temp: ";
     String temp_string = "--";
     String unit = "";
     float temp_float;
-    sensors.requestTemperatures();
     if (config.getString(String("b_celsius").c_str()) != "false") {
       unit = "°C";
-      temp_float = sensors.getTempCByIndex(0);
+      temp_float = last_temp_c;
     } else {
       unit = "°F";
-      temp_float = sensors.getTempFByIndex(0);
-    }    
+      temp_float = last_temp_f;
+    }
     if (temp_float > -100){
       temp_string = String(temp_float, 1);
     }
     ret = label + temp_string + unit;
-  } 
+  }
   return ret;
 }
 
@@ -1944,63 +1965,14 @@ void setup() {
   WT32_ETH01_waitForConnect();
 
   /**********************************************************************************************************************
-   * WEB SERVER ROUTE REGISTRATION
-   *
-   * Defines HTTP endpoints and maps them to handler functions:
-   *
-   *  "/"            -> Root dashboard interface
-   *  "/readDATA"    -> Live measurement data endpoint (RF power, SWR, etc.)
-   *  "/config"      -> Configuration UI page
-   *  "/modcfg"      -> Configuration modification handler
-   *  "/selectband"  -> Frequency band selection handler
-   *  "/modcal"      -> Calibration adjustment handler
-   **********************************************************************************************************************/
-  server.on(F("/"), handleRoot);
-  server.on("/readDATA", handleDATA);
-  server.on("/config", handleCONFIG);
-  server.on("/modcfg", handleMODCFG);
-  server.on("/selectband", handleBAND);
-  server.on("/modcal", handleMODCAL);
-
-  /**********************************************************************************************************************
-   * SPIFFS FILESYSTEM INITIALIZATION
-   *
-   * Mounts internal flash filesystem used for serving static assets
-   * (HTML/CSS/JS files, configuration resources).
-   *
-   * FORMAT_SPIFFS_IF_FAILED:
-   *  If mounting fails, filesystem may be reformatted automatically depending on config.
-   **********************************************************************************************************************/
-  if (!SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED)) {
-    Serial.println("SPIFFS Mount Failed");
-    return;
-  }
-
-  /**********************************************************************************************************************
-   * FALLBACK ROUTE HANDLING
-   *
-   * Registers a catch-all handler for undefined HTTP routes.
-   * Ensures proper 404-style behavior and debugging visibility.
-   **********************************************************************************************************************/
-  server.onNotFound(handleNotFound);
-
-  /**********************************************************************************************************************
-   * START HTTP SERVER
-   *
-   * Begins listening for incoming TCP connections on port 80 (default).
-   * At this point the device becomes reachable via browser.
-   **********************************************************************************************************************/
-  server.begin();
-
-  Serial.print(F("HTTP EthernetWebServer is @ IP : "));
-  Serial.println(ETH.localIP());
-
-  /**********************************************************************************************************************
    * ADC CONFIGURATION
    *
    * Sets ADC resolution to 12-bit:
    * - Range: 0–4095
    * - Required for consistent RF detector sampling accuracy
+   *
+   * Done early and independent of SPIFFS/NVS so measurement is ready regardless
+   * of what happens below.
    **********************************************************************************************************************/
   analogReadResolution(12);
 
@@ -2009,9 +1981,23 @@ void setup() {
    *
    * Opens NVS namespace "config" for reading/writing system-wide settings.
    * Retrieves selected frequency band from non-volatile storage.
+   * Independent of SPIFFS, so this runs regardless of filesystem mount state.
    **********************************************************************************************************************/
   global_config.begin("config", false);
   band = global_config.getString(String("x_selected_band").c_str());
+
+  /**********************************************************************************************************************
+   * OTA PASSWORD
+   *
+   * Loads the OTA password from NVS, falling back to (and persisting) the factory default on
+   * first-ever boot. As long as it's still the default, handleRoot()/handleCONFIG() refuse to
+   * serve the normal UI and force a real password to be set first.
+   **********************************************************************************************************************/
+  ota_password = global_config.getString(String("x_ota_pass").c_str());
+  if (ota_password == "") {
+    ota_password = OTA_DEFAULT_PASSWORD;
+    global_config.putString(String("x_ota_pass").c_str(), ota_password);
+  }
 
   /**********************************************************************************************************************
    * DEFAULT BAND FALLBACK LOGIC
@@ -2034,12 +2020,121 @@ void setup() {
   config.begin(bnd_cnf.c_str(), false);
 
   /**********************************************************************************************************************
+   * SPIFFS FILESYSTEM INITIALIZATION
+   *
+   * Mounts internal flash filesystem used for serving static assets
+   * (HTML/CSS/JS files, configuration resources).
+   *
+   * FORMAT_SPIFFS_IF_FAILED:
+   *  If mounting fails, filesystem may be reformatted automatically depending on config.
+   *
+   * IMPORTANT: a mount failure here used to `return` out of setup() entirely,
+   * meaning the web server never started at all -- the device went completely
+   * silent with nothing but a serial print, on a device that's often mounted
+   * somewhere inconvenient to reach. Now a failure only degrades calibration
+   * features (readFile() already handles missing files gracefully, returning
+   * an empty string), while the dashboard, network, OTA, and watchdog still
+   * come up normally.
+   **********************************************************************************************************************/
+  bool spiffs_ok = SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED);
+  if (!spiffs_ok) {
+    Serial.println("SPIFFS Mount Failed -- calibration data unavailable, continuing without it");
+  }
+
+  /**********************************************************************************************************************
+   * WEB SERVER ROUTE REGISTRATION
+   *
+   * Defines HTTP endpoints and maps them to handler functions:
+   *
+   *  "/"            -> Root dashboard interface
+   *  "/readDATA"    -> Live measurement data endpoint (RF power, SWR, etc.)
+   *  "/config"      -> Configuration UI page
+   *  "/modcfg"      -> Configuration modification handler
+   *  "/selectband"  -> Frequency band selection handler
+   *  "/modcal"      -> Calibration adjustment handler
+   **********************************************************************************************************************/
+  server.on(F("/"), handleRoot);
+  server.on("/readDATA", handleDATA);
+  server.on("/config", handleCONFIG);
+  server.on("/modcfg", handleMODCFG);
+  server.on("/selectband", handleBAND);
+  server.on("/modcal", handleMODCAL);
+  server.on("/setotapass", handleSETOTAPASS);
+
+  /**********************************************************************************************************************
+   * FALLBACK ROUTE HANDLING
+   *
+   * Registers a catch-all handler for undefined HTTP routes.
+   * Ensures proper 404-style behavior and debugging visibility.
+   **********************************************************************************************************************/
+  server.onNotFound(handleNotFound);
+
+  /**********************************************************************************************************************
+   * START HTTP SERVER
+   *
+   * Begins listening for incoming TCP connections on port 80 (default).
+   * At this point the device becomes reachable via browser.
+   **********************************************************************************************************************/
+  server.begin();
+
+  Serial.print(F("HTTP EthernetWebServer is @ IP : "));
+  Serial.println(ETH.localIP());
+
+  /**********************************************************************************************************************
+   * mDNS -- reachable as "<device_hostname>.local" instead of only the
+   * hardcoded static IP. device_hostname is defined near the top of this
+   * file for easy editing before flashing.
+   **********************************************************************************************************************/
+  if (MDNS.begin(device_hostname.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.print(F("mDNS responder started: http://"));
+    Serial.print(device_hostname);
+    Serial.println(F(".local"));
+  } else {
+    Serial.println(F("mDNS responder failed to start"));
+  }
+
+  /**********************************************************************************************************************
+   * OTA (Over-The-Air) firmware updates via LAN -- lets you reflash this
+   * device (e.g. from the Arduino IDE's Network Ports) without needing
+   * physical USB access, which matters for a meter mounted somewhere remote.
+   **********************************************************************************************************************/
+  ArduinoOTA.setHostname(device_hostname.c_str());
+  ArduinoOTA.setPassword(ota_password.c_str());
+  ArduinoOTA.onStart([]() {
+    Serial.println(F("OTA update starting"));
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println(F("OTA update complete"));
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA progress: %u%%\r\n", (progress * 100) / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA error [%u]\r\n", error);
+  });
+  ArduinoOTA.begin();
+
+  /**********************************************************************************************************************
    * UI CONFIGURATION RENDERING
    *
    * Builds HTML form elements (textareas, tables, etc.) representing
-   * the current configuration state for the web interface.
+   * the current configuration state for the web interface. Safe to call
+   * even if SPIFFS failed to mount above (readFile() degrades gracefully).
    **********************************************************************************************************************/
   build_textareas();
+
+  /**********************************************************************************************************************
+   * WATCHDOG TIMER
+   *
+   * If loop() doesn't check in (via esp_task_wdt_reset()) within
+   * WDT_TIMEOUT_SECONDS, the device reboots instead of staying silently
+   * wedged -- important for a meter that isn't easily power-cycled by hand.
+   * Enabled last, after every blocking setup step (Ethernet wait, mDNS,
+   * OTA) has already completed, so none of that startup time counts against it.
+   **********************************************************************************************************************/
+  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+  esp_task_wdt_add(NULL);
 }
 
 
@@ -2047,16 +2142,19 @@ void setup() {
  *  MAIN EXECUTION LOOP
  *
  *  This function runs continuously after setup() completes.
- *  Its primary responsibility is to process incoming HTTP client requests.
  *
  *  server.handleClient():
- *    - Checks for incoming TCP connections
- *    - Parses HTTP requests
- *    - Dispatches registered route handlers
- *    - Maintains web UI responsiveness
+ *    - Checks for incoming TCP connections, parses HTTP requests, dispatches
+ *      registered route handlers, and maintains web UI responsiveness.
  *
- *  The loop is intentionally lightweight because the ESP32 web server is event-driven.
+ *  ArduinoOTA.handle():
+ *    - Services pending over-the-air firmware update requests.
+ *
+ *  esp_task_wdt_reset():
+ *    - Feeds the watchdog timer to confirm the loop is still alive.
  ****************************************************************************************************************************/
 void loop() {
   server.handleClient();
+  ArduinoOTA.handle();
+  esp_task_wdt_reset();
 }
