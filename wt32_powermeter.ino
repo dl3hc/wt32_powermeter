@@ -2107,6 +2107,11 @@ void setup() {
     Serial.println(F("OTA update complete"));
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    // ArduinoOTA.handle() blocks in loop() for the whole transfer, so esp_task_wdt_reset()
+    // at the bottom of loop() never runs until it's done -- feed the watchdog here instead,
+    // since this fires after every chunk written, or the watchdog reboots mid-update on
+    // anything slower than WDT_TIMEOUT_SECONDS.
+    esp_task_wdt_reset();
     Serial.printf("OTA progress: %u%%\r\n", (progress * 100) / total);
   });
   ArduinoOTA.onError([](ota_error_t error) {
