@@ -111,9 +111,18 @@ The following steps are required to compile and upload the code to the board:
 3. Select the correct board in the Arduino IDE:  
    **Tools → Board → esp32 → ESP32 Dev Module**
 
-4. Install the required libraries:  
-   **Tools → Manage Libraries →** search for and install **WebServer_WT32_ETH01**,
-   **DallasTemperature**, and **OneWire** (see [Prerequisites](#prerequisites) above)
+4. Install **DallasTemperature** and **OneWire**:  
+   **Tools → Manage Libraries →** search for and install each (see [Prerequisites](#prerequisites) above)
+
+5. Install **WebServer_WT32_ETH01** from the fork -- **not** from Library Manager. Library
+   Manager only offers the original `khoih-prog/WebServer_WT32_ETH01`, which fails to compile
+   on ESP32 core 3.x (see the note under [Prerequisites](#prerequisites) above); the fork at
+   https://github.com/dl3hc/WebServer_WT32_ETH01-fork carries the fix. Either:
+   - Clone it directly into your Arduino libraries folder:  
+     `git clone https://github.com/dl3hc/WebServer_WT32_ETH01-fork ~/Arduino/libraries/WebServer_WT32_ETH01`
+     (on Windows, typically `Documents\Arduino\libraries\WebServer_WT32_ETH01`), or
+   - Download the fork as a ZIP from GitHub and use **Sketch → Include Library → Add .ZIP
+     Library...** in the Arduino IDE.
 
 ## Downloading the Software
 
