@@ -1,6 +1,3 @@
-#include <WebServer_WT32_ETH01.h>
-#include <WebServer_WT32_ETH01.hpp>
-
 /****************************************************************************************************************************
   Remote Power/SWR Meter - a solution to remotely measure RF power and VSWR over ethernet
 
