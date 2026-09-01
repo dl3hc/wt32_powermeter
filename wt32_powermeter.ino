@@ -550,13 +550,24 @@ double millivolt_to_dbm(int mv, bool fwd) {
     }
   }
 
-  // mv fell outside the calibrated range, or only one side of the
-  // interpolation pair was found: clamp to the nearest real calibration
-  // point instead of interpolating against a fabricated endpoint, which
-  // would otherwise divide by zero below.
+  // Below the lowest calibrated point: a diode/log detector's output reliably
+  // approaches its floor as RF input approaches zero, so interpolate from an
+  // implicit (0 mV, 0 dBm) anchor up to the lowest real point, rather than
+  // clamping. Clamping here previously made any well-matched (near-zero
+  // reflected power) reading floor at the lowest calibrated dBm value,
+  // inflating computed VSWR. Only applies to ascending tables (higher mV
+  // means higher dBm) -- for a descending table, zero mV would imply the
+  // *highest* dBm, which doesn't correspond to a physical "no signal" state,
+  // so that direction still clamps below.
   if (!have_lastval) {
+    if (ascending && nextkey > 0) {
+      return (nextval / (double)nextkey) * mv;
+    }
     return nextval;
   }
+  // Above the highest calibrated point: no safe implicit anchor exists (the
+  // detector could be saturating), so clamp to the nearest real point instead
+  // of extrapolating into unknown territory.
   if (!have_nextval) {
     return lastval;
   }
