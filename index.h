@@ -60,8 +60,8 @@ const char MAIN_page[] PROGMEM = R"=====(
   </main>
 
   <footer class="statusbar">
-    <span class="statusbar__temp" id="temp_box"><span id="TEMPValue">0</span></span>
     <form method="post" action="config"><button class="button" value="config" name="config" type="submit">Configuration</button></form>
+    <span class="statusbar__temp" id="temp_box"><span id="TEMPValue">0</span></span>
     <span class="statusbar__version">wt32powermeter v<span id="version">0</span> by DK1MI, maintained by DL3HC</span>
   </footer>
 
