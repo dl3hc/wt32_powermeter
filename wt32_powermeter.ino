@@ -686,21 +686,8 @@ void read_directional_couplers() {
     voltage_ref_raw = voltage_ref_max;
   }
 
-  // Exponential moving average across polls: smooths out ADC/detector jitter
-  // that would otherwise get amplified by steep calibration segments and
-  // show up as jumpy bars, without needing more calibration points.
-  static double voltage_fwd_ema = -1;
-  static double voltage_ref_ema = -1;
-  const double ema_alpha = 0.3;
-  if (voltage_fwd_ema < 0) {
-    voltage_fwd_ema = voltage_fwd_raw;
-    voltage_ref_ema = voltage_ref_raw;
-  } else {
-    voltage_fwd_ema = ema_alpha * voltage_fwd_raw + (1 - ema_alpha) * voltage_fwd_ema;
-    voltage_ref_ema = ema_alpha * voltage_ref_raw + (1 - ema_alpha) * voltage_ref_ema;
-  }
-  voltage_fwd = (int)round(voltage_fwd_ema);
-  voltage_ref = (int)round(voltage_ref_ema);
+  voltage_fwd = voltage_fwd_raw;
+  voltage_ref = voltage_ref_raw;
 
   // calculate the dBm value from the voltage based on the calibration table
   fwd_dbm = millivolt_to_dbm(voltage_fwd, true);
