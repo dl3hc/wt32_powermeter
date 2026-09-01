@@ -89,10 +89,14 @@ The wiring was done according to the picture shown further below.
   - `ArduinoOTA` -- used for over-the-air firmware updates
   - `esp_task_wdt` -- used for the watchdog timer
 
-  These three are only guaranteed to be available if you're on the classic ESP32 Arduino core
-  (2.x). If you're on core 3.x (IDF5-based), the watchdog init call in `setup()` uses a different
-  API signature and will need a small adjustment -- see the comment above
-  `esp_task_wdt_init(...)` in `wt32_powermeter.ino`.
+  The sketch compiles on both the classic ESP32 Arduino core (2.x) and the IDF5-based core
+  (3.x). `ETH.begin()` and the watchdog init call are written to work on either -- the latter
+  is version-guarded in `setup()` since core 3.x replaced the old `(timeout_seconds, panic)`
+  signature with a config struct.
+
+  Note: the `WebServer_WT32_ETH01` library only builds on core 3.x with the fix in the fork
+  linked above (upstream's `#if ESP32` check evaluates to false against core 3.x's
+  `-DESP32=ESP32` define; the fork uses `#if defined(ESP32)` instead).
 
 ## Downloading and Setting Up the Arduino IDE
 

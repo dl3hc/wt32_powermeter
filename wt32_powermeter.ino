@@ -1938,9 +1938,11 @@ void setup() {
    * ETHERNET PHY INITIALIZATION
    *
    * Starts the LAN8720 Ethernet interface via ESP32 ETH driver.
-   * ETH_PHY_ADDR and ETH_PHY_POWER define hardware-specific configuration parameters.
+   * Reads ETH_PHY_TYPE/ADDR/MDC/MDIO/POWER/CLK_MODE, all defined by
+   * WebServer_WT32_ETH01.h, either as defaults (core 2.x) or via the
+   * zero-arg begin() convenience overload (core 3.x).
    **********************************************************************************************************************/
-  ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER);
+  ETH.begin();
 
   /**********************************************************************************************************************
    * STATIC IP CONFIGURATION (OPTIONAL)
@@ -2133,7 +2135,17 @@ void setup() {
    * Enabled last, after every blocking setup step (Ethernet wait, mDNS,
    * OTA) has already completed, so none of that startup time counts against it.
    **********************************************************************************************************************/
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  // Core 3.x (IDF5+) replaced the (timeout_seconds, panic) signature with a config struct.
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+#else
   esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+#endif
   esp_task_wdt_add(NULL);
 }
 
